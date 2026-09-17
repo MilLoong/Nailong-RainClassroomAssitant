@@ -168,6 +168,8 @@ def get_config_dir():
     return dir_route
 
 def get_user_info(sessionid):
+    # 用电脑端 sessionid 请求用户信息，校验登录是否仍有效。
+    # 返回 (code, data)；网络异常时 code 为 None，勿当作登录过期。
     try:
         url = "https://www.yuketang.cn/api/v3/user/basic-info"
         r = requests.get(url=url, cookies={"sessionid": sessionid}, timeout=5,
@@ -175,7 +177,33 @@ def get_user_info(sessionid):
         rtn = dict_result(r.text)
         return (rtn.get("code", -1), rtn.get("data", {}))
     except:
-        return (-1, {})
+        return (None, {})
+
+def get_user_info_by_sid(sid):
+    # 用手机端 sid 请求同一接口，校验手机端凭证是否过期。
+    # 返回 (code, data)；网络异常时 code 为 None，勿当作登录过期。
+    try:
+        url = "https://www.yuketang.cn/api/v3/user/basic-info"
+        headers = {
+            "x-client": "app",
+            "xtbz": "ykt",
+            "User-Agent": "Mozilla/5.0",
+            "Cookie": "sid=%s" % sid,
+        }
+        r = requests.get(url=url, headers=headers, timeout=5,
+                         proxies={"http": None, "https": None})
+        rtn = dict_result(r.text)
+        return (rtn.get("code", -1), rtn.get("data", {}))
+    except:
+        return (None, {})
+
+def is_token_valid(code, data):
+    # True=有效，False=过期/无效，None=网络异常无法判断。
+    if code is None:
+        return None
+    if code != 0 or not isinstance(data, dict) or not data:
+        return False
+    return bool(data.get("id") or data.get("name"))
 
 def get_on_lesson(sessionid):
     headers = {"Cookie": "sessionid=%s" % sessionid}

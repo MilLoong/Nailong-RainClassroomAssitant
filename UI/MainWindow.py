@@ -9,8 +9,10 @@ from Scripts.Utils import (
     get_config_path,
     get_initial_data,
     get_user_info,
+    get_user_info_by_sid,
     get_title_font_family,
     get_ui_font_family,
+    is_token_valid,
     normalize_config,
     resource_path,
     say_something,
@@ -33,6 +35,27 @@ class MainWindow_Ui(QtCore.QObject):
     update_problem_signal = QtCore.pyqtSignal(str)
     # 用户信息面板专用信号（跨线程安全更新右侧面板）
     _user_panel_signal    = QtCore.pyqtSignal(str, str, str, QtGui.QPixmap)
+    # 登录凭证校验结果（跨线程）：session_ok, sid_ok, name, school, sno, avatar
+    _token_check_signal   = QtCore.pyqtSignal(bool, bool, str, str, str, QtGui.QPixmap)
+
+    def _save_config(self):
+        try:
+            with open(get_config_path(), "w", encoding="utf-8") as f:
+                json.dump(self.config, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _clear_login_panel(self, hint="微信扫码登录", hint_color="#888"):
+        self.avatarLabel.clear()
+        self.avatarLabel.setStyleSheet(
+            "border: 1px solid #e0e0e0; border-radius: 8px; background: #fafafa;"
+        )
+        self.qrHint.setText(hint)
+        self.qrHint.setStyleSheet(f"font: 9pt '{get_ui_font_family()}'; color: {hint_color};")
+        self._badge_waiting()
+        self.nameLabel.setText("—")
+        self.schoolVal.setText("—")
+        self.snoVal.setText("—")
 
     @QtCore.pyqtSlot()
     def refresh_login_status(self):
@@ -48,30 +71,20 @@ class MainWindow_Ui(QtCore.QObject):
         sessionid = self.config.get("sessionid", "")
         sid = self.config.get("sid", "")
 
-        if sessionid:
-            self.update_status_signal.emit("已登录")
-            threading.Thread(
-                target=self._fetch_and_emit_user_info,
-                args=(sessionid,),
-                daemon=True
-            ).start()
-        elif sid:
-            self.update_status_signal.emit("手机端已登录")
-            self.qrHint.setText("手机端凭证已就绪，监听仍需电脑端扫码")
-            self.qrHint.setStyleSheet(f"font: 9pt '{get_ui_font_family()}'; color: #d46b08;")
-            self._badge_success()
-        else:
+        if not sessionid and not sid:
             self.update_status_signal.emit("未登录")
-            self.avatarLabel.clear()
-            self.avatarLabel.setStyleSheet(
-                "border: 1px solid #e0e0e0; border-radius: 8px; background: #fafafa;"
-            )
-            self.qrHint.setText("微信扫码登录")
-            self.qrHint.setStyleSheet(f"font: 9pt '{get_ui_font_family()}'; color: #888;")
-            self._badge_waiting()
-            self.nameLabel.setText("—")
-            self.schoolVal.setText("—")
-            self.snoVal.setText("—")
+            # 已在刷二维码时不要清掉头像上的二维码
+            if not getattr(self, "_ws_flush_on", False):
+                self._clear_login_panel()
+                self._start_login_ws()
+            return
+
+        self.update_status_signal.emit("正在校验登录状态...")
+        threading.Thread(
+            target=self._check_tokens_and_emit,
+            args=(sessionid, sid),
+            daemon=True
+        ).start()
 
     def setupUi(self, MainWindow):
         ui_font_family = get_ui_font_family()
@@ -83,7 +96,10 @@ class MainWindow_Ui(QtCore.QObject):
         dir_route = get_config_dir()
         config_route = get_config_path()
         self.config, _config_msg = self.check_config(dir_route, config_route)
+        _had_sessionid = bool(self.config.get("sessionid", ""))
         _login_status, _user_info = self.check_login()
+        # 仅在确认过期并清空凭证后提示；网络异常会保留 sessionid
+        _session_expired = _had_sessionid and not _login_status and not self.config.get("sessionid")
 
         MainWindow.setObjectName("MainWindow")
         MainWindow.resize(1070, 800)
@@ -358,6 +374,7 @@ class MainWindow_Ui(QtCore.QObject):
         self.update_problem_signal.connect(self.update_problem, QtCore.Qt.QueuedConnection)
         self.update_status_signal.connect(self.statusbar.showMessage, QtCore.Qt.QueuedConnection)
         self._user_panel_signal.connect(self._on_user_info_ready, QtCore.Qt.QueuedConnection)
+        self._token_check_signal.connect(self._on_token_check_ready, QtCore.Qt.QueuedConnection)
 
         self.add_message_signal.emit(_config_msg, 0)
         self.add_message_signal.emit("初始化完成", 0)
@@ -372,6 +389,8 @@ class MainWindow_Ui(QtCore.QObject):
             ).start()
             self.add_message_signal.emit("登录成功，当前登录用户：" + _user_info.get("name", ""), 0)
         else:
+            if _session_expired:
+                self.add_message_signal.emit("电脑端登录已过期，请重新扫码登录", 0)
             if not self.config.get("sessionid"):
                 self._start_login_ws()
 
@@ -513,25 +532,124 @@ class MainWindow_Ui(QtCore.QObject):
         self._ws_flush_thread = threading.Thread(target=_flush, daemon=True)
         self._ws_flush_thread.start()
 
+    def _load_avatar_pixmap(self, avatar_url):
+        px = QtGui.QPixmap()
+        if avatar_url:
+            try:
+                img = requests.get(
+                    avatar_url, proxies={"http": None, "https": None}, timeout=5
+                ).content
+                px.loadFromData(img)
+            except Exception:
+                pass
+        return px
+
+    def _check_tokens_and_emit(self, sessionid, sid):
+        # 子线程：分别请求接口校验电脑端 sessionid / 手机端 sid 是否过期。
+        session_ok = False
+        sid_ok = False
+        user_data = {}
+        changed = False
+        network_error = False
+
+        if sessionid:
+            code, data = get_user_info(sessionid)
+            valid = is_token_valid(code, data)
+            if valid is True:
+                session_ok = True
+                user_data = data
+            elif valid is False:
+                self.config["sessionid"] = ""
+                changed = True
+                self.add_message_signal.emit("电脑端登录已过期，请重新扫码登录", 0)
+            else:
+                network_error = True
+                # 网络异常时暂按“仍持有凭证”展示，不清空
+                session_ok = True
+
+        if sid:
+            code, data = get_user_info_by_sid(sid)
+            valid = is_token_valid(code, data)
+            if valid is True:
+                sid_ok = True
+                if not user_data:
+                    user_data = data
+            elif valid is False:
+                self.config["sid"] = ""
+                changed = True
+                self.add_message_signal.emit("手机端登录已过期，请到配置页重新验证登录", 0)
+            else:
+                network_error = True
+                sid_ok = True
+
+        if changed:
+            self._save_config()
+
+        if network_error and not user_data:
+            self.add_message_signal.emit("网络异常，暂时无法校验登录状态", 0)
+
+        name = user_data.get("name", "—") if user_data else "—"
+        school = user_data.get("school", "—") if user_data else "—"
+        sno = user_data.get("schoolNumber", "—") if user_data else "—"
+        avatar_px = self._load_avatar_pixmap(user_data.get("avatar", "") if user_data else "")
+        self._token_check_signal.emit(session_ok, sid_ok, name, school, sno, avatar_px)
+
+    def _on_token_check_ready(self, session_ok, sid_ok, name, school, sno, avatar_px):
+        # 主线程：根据校验结果刷新右侧登录面板。
+        if session_ok:
+            self.update_status_signal.emit("已登录")
+            if name != "—" or not avatar_px.isNull():
+                self._on_user_info_ready(name, school, sno, avatar_px)
+            else:
+                self.qrHint.setText("已登录（网络异常，用户信息暂不可用）")
+                self.qrHint.setStyleSheet(f"font: 9pt '{get_ui_font_family()}'; color: #fa8c16;")
+                self._badge_success()
+            return
+
+        if sid_ok:
+            self.update_status_signal.emit("手机端已登录")
+            if not avatar_px.isNull() or name != "—":
+                self._on_user_info_ready(name, school, sno, avatar_px)
+                self.qrHint.setText("手机端凭证有效，监听仍需电脑端扫码")
+                self.qrHint.setStyleSheet(f"font: 9pt '{get_ui_font_family()}'; color: #d46b08;")
+            else:
+                self.qrHint.setText("手机端凭证有效，监听仍需电脑端扫码")
+                self.qrHint.setStyleSheet(f"font: 9pt '{get_ui_font_family()}'; color: #d46b08;")
+                self._badge_success()
+                self.nameLabel.setText(name)
+                self.schoolVal.setText(school)
+                self.snoVal.setText(sno)
+            if not self.config.get("sessionid"):
+                self._start_login_ws()
+            return
+
+        self.update_status_signal.emit("未登录")
+        self._clear_login_panel("登录已过期，请重新扫码", "#f00")
+        if not getattr(self, "_ws_flush_on", False):
+            self._start_login_ws()
+
     def _fetch_and_emit_user_info(self, sessionid):
-        # 子线程：拉取用户信息后 emit 信号更新右侧面板。
+        # 子线程：拉取用户信息后 emit 信号更新右侧面板；无效则清理并复检剩余凭证。
         try:
             code, data = get_user_info(sessionid)
-            if code != 0 or not data:
+            valid = is_token_valid(code, data)
+            if valid is False:
+                if self.config.get("sessionid") == sessionid:
+                    self.config["sessionid"] = ""
+                    self._save_config()
+                self.add_message_signal.emit("电脑端登录已过期，请重新扫码登录", 0)
+                self._check_tokens_and_emit(
+                    self.config.get("sessionid", ""),
+                    self.config.get("sid", "")
+                )
+                return
+            if valid is None:
+                self.add_message_signal.emit("网络异常，暂时无法校验登录状态", 0)
                 return
             name   = data.get("name", "—")
             school = data.get("school", "—")
             sno    = data.get("schoolNumber", "—")
-            avatar_url = data.get("avatar", "")
-            px = QtGui.QPixmap()
-            if avatar_url:
-                try:
-                    img = requests.get(
-                        avatar_url, proxies={"http": None, "https": None}, timeout=5
-                    ).content
-                    px.loadFromData(img)
-                except Exception:
-                    pass
+            px = self._load_avatar_pixmap(data.get("avatar", ""))
             self._user_panel_signal.emit(name, school, sno, px)
         except Exception:
             pass
@@ -668,27 +786,17 @@ class MainWindow_Ui(QtCore.QObject):
         self.current_mode = mode
 
         sessionid = self.config.get("sessionid", "")
+        sid = self.config.get("sid", "")
 
-        if sessionid and not force_relogin:
-            self._badge_success()
-            threading.Thread(
-                target=self._fetch_and_emit_user_info,
-                args=(sessionid,),
-                daemon=True
-            ).start()
+        if force_relogin:
+            self._clear_login_panel()
+            self._start_login_ws()
+            return
+
+        if sessionid or sid:
+            self.refresh_login_status()
         else:
-            self.avatarLabel.clear()
-            self.avatarLabel.setStyleSheet(
-                "border: 1px solid #e0e0e0; border-radius: 8px; background: #fafafa;"
-            )
-            self.qrHint.setText("微信扫码登录")
-            self.qrHint.setStyleSheet(f"font: 9pt '{get_ui_font_family()}'; color: #888;")
-            self._badge_waiting()
-
-            self.nameLabel.setText("—")
-            self.schoolVal.setText("—")
-            self.snoVal.setText("—")
-
+            self._clear_login_panel()
             self._start_login_ws()
 
     def check_config(self, dir_route, config_route):
@@ -716,12 +824,18 @@ class MainWindow_Ui(QtCore.QObject):
                 return initial_data, "配置文件读取失败，已重新生成"
 
     def check_login(self):
+        # 启动时同步校验电脑端 sessionid；过期则清空，避免残留假登录状态。
+        # 网络异常时保留凭证，按未确认登录处理（不清配置）。
         sessionid = self.config.get("sessionid", "")
         if not sessionid:
             return False, {}
         code, user_info = get_user_info(sessionid)
-        if code == 0:
+        valid = is_token_valid(code, user_info)
+        if valid is True:
             return True, user_info
+        if valid is False:
+            self.config["sessionid"] = ""
+            self._save_config()
         return False, {}
 
     def add_message(self, message, type=0):
